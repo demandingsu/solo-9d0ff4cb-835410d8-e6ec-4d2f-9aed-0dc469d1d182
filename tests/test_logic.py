@@ -2,7 +2,15 @@
 
 from datetime import date
 
-from app.logic import CoverageRow, compute_segments, subtract_months
+from app.logic import (
+    CoverageRow,
+    NoticeRow,
+    classify_notices,
+    compute_segments,
+    latest_per_source,
+    packages_serving,
+    subtract_months,
+)
 
 
 def test_subtract_months_plain():
@@ -64,3 +72,89 @@ def test_different_embargoes_split_sources():
         (date(2020, 1, 1), date(2025, 6, 15), ("A", "B")),
         (date(2025, 6, 16), date(2026, 6, 15), ("A",)),
     ]
+
+
+# ---------------------------------------------------------- notice logic
+
+def test_latest_per_source_ignores_arrival_order():
+    notices = [
+        NoticeRow("crossref", 3, "retraction"),
+        NoticeRow("crossref", 1, "restoration"),  # late, lower revision
+        NoticeRow("publisher", 2, "retraction"),
+    ]
+    best = latest_per_source(notices)
+    assert best["crossref"].revision == 3
+    assert best["publisher"].revision == 2
+
+
+def test_classify_no_notices():
+    assert classify_notices([]) == ("none", [])
+
+
+def test_classify_single_source_retraction():
+    status, basis = classify_notices([NoticeRow("crossref", 1, "retraction")])
+    assert status == "retracted"
+    assert basis == [NoticeRow("crossref", 1, "retraction")]
+
+
+def test_classify_retraction_then_restoration_same_source():
+    notices = [
+        NoticeRow("crossref", 1, "retraction"),
+        NoticeRow("crossref", 2, "restoration"),
+    ]
+    status, basis = classify_notices(notices)
+    assert status == "restored"
+    assert basis == [NoticeRow("crossref", 2, "restoration")]
+
+
+def test_classify_out_of_order_lower_revision_does_not_override():
+    # restoration rev 2 arrives first, retraction rev 1 arrives late
+    notices = [
+        NoticeRow("crossref", 2, "restoration"),
+        NoticeRow("crossref", 1, "retraction"),
+    ]
+    status, _ = classify_notices(notices)
+    assert status == "restored"
+
+
+def test_classify_contradicting_sources_is_disputed():
+    notices = [
+        NoticeRow("crossref", 2, "retraction"),
+        NoticeRow("publisher", 5, "restoration"),
+    ]
+    status, basis = classify_notices(notices)
+    assert status == "disputed"
+    # basis carries each source's latest notice, sorted by source
+    assert basis == [
+        NoticeRow("crossref", 2, "retraction"),
+        NoticeRow("publisher", 5, "restoration"),
+    ]
+
+
+def test_classify_dispute_resolves_when_source_advances():
+    notices = [
+        NoticeRow("crossref", 1, "retraction"),
+        NoticeRow("publisher", 1, "restoration"),
+        NoticeRow("publisher", 2, "retraction"),
+    ]
+    status, basis = classify_notices(notices)
+    assert status == "retracted"
+    assert all(n.kind == "retraction" for n in basis)
+
+
+def test_packages_serving_respects_moving_wall():
+    rows = [CoverageRow("A", date(2020, 1, 1), date(2026, 12, 31), 6)]
+    # pub date inside embargo window on 2026-01-01 (wall at 2025-07-01)
+    assert packages_serving(rows, date(2025, 8, 1), date(2026, 1, 1)) == []
+    # same pub date accessible once the wall has moved past it
+    assert packages_serving(rows, date(2025, 8, 1), date(2026, 3, 1)) == ["A"]
+
+
+def test_packages_serving_merges_multiple_packages():
+    rows = [
+        CoverageRow("B", date(2020, 1, 1), date(2026, 12, 31), 0),
+        CoverageRow("A", date(2020, 1, 1), date(2026, 12, 31), 0),
+        CoverageRow("C", date(2024, 1, 1), date(2024, 12, 31), 0),
+    ]
+    assert packages_serving(rows, date(2024, 6, 1), date(2026, 1, 1)) == ["A", "B", "C"]
+    assert packages_serving(rows, date(2025, 6, 1), date(2026, 1, 1)) == ["A", "B"]

@@ -44,6 +44,30 @@ CREATE TABLE IF NOT EXISTS coverage (
 );
 CREATE INDEX IF NOT EXISTS idx_coverage_issn ON coverage(issn);
 CREATE INDEX IF NOT EXISTS idx_coverage_pkg  ON coverage(package_id);
+
+-- Articles registered by DOI.  A notice may arrive before its article;
+-- both are joined only at query time, so late-registered articles still
+-- enter the retraction determination.
+CREATE TABLE IF NOT EXISTS articles (
+    doi      TEXT PRIMARY KEY,          -- normalized lowercase DOI
+    issn     TEXT NOT NULL,             -- normalized XXXX-XXXX, upper case
+    pub_date TEXT NOT NULL              -- ISO date
+);
+
+-- Retraction / restoration notices.  (doi, source, revision) is the
+-- identity of a notice: resubmitting identical content is a no-op,
+-- resubmitting different content under the same key is rejected (409).
+-- Arrival order is preserved by the rowid/autoincrement id.
+CREATE TABLE IF NOT EXISTS notices (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    doi      TEXT NOT NULL,             -- normalized lowercase DOI
+    source   TEXT NOT NULL,             -- notice source, e.g. "crossref"
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    kind     TEXT NOT NULL CHECK (kind IN ('retraction', 'restoration')),
+    note     TEXT,
+    UNIQUE (doi, source, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_notices_doi ON notices(doi);
 """
 
 

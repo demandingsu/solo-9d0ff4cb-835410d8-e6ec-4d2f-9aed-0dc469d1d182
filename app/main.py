@@ -1,24 +1,40 @@
-"""FastAPI application: journal coverage snapshots -> access segments."""
+"""FastAPI application: journal coverage snapshots -> access segments,
+plus retraction/restoration notices -> 'retracted but still accessible' report."""
 
 from __future__ import annotations
 
 import sqlite3
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import date
-from typing import Annotated, List
+from typing import Annotated, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import RedirectResponse
 
 from . import db
-from .logic import CoverageRow, compute_segments
+from .logic import (
+    CoverageRow,
+    NoticeRow,
+    classify_notices,
+    compute_segments,
+    packages_serving,
+)
 from .schemas import (
     AccessResponse,
+    ArticleOut,
+    ArticleUpsert,
     CoverageSnapshot,
     LicenseUpdate,
+    NoticeBasis,
+    NoticeCreate,
+    NoticeOut,
     PackageCreate,
     PackageOut,
+    RetractionEntry,
+    RetractionReport,
     SegmentOut,
+    normalize_doi,
     normalize_issn,
 )
 
@@ -31,12 +47,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Library Journal Access API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Stores per-package journal coverage snapshots (ISSN, publication "
         "date range, embargo months) and package license windows, then "
         "answers, for a query date + ISSN, which publication date ranges "
-        "are accessible and from which packages."
+        "are accessible and from which packages.  Articles registered by "
+        "DOI plus sourced retraction/restoration notices yield a report "
+        "of articles that are retracted but still accessible, so readers "
+        "do not mistake accessibility for trustworthiness."
     ),
     lifespan=lifespan,
 )
@@ -224,4 +243,235 @@ def access(
         segments=[
             SegmentOut(start=s.start, end=s.end, sources=list(s.sources)) for s in segments
         ],
+    )
+
+
+# ---------------------------------------------------------------- articles
+
+def _article_out(row: sqlite3.Row) -> ArticleOut:
+    return ArticleOut(
+        doi=row["doi"], issn=row["issn"], pub_date=date.fromisoformat(row["pub_date"])
+    )
+
+
+@app.put("/articles", response_model=ArticleOut)
+def upsert_article(body: ArticleUpsert, response: Response) -> ArticleOut:
+    """Register an article by DOI, or correct its ISSN / publication date.
+
+    Idempotent: re-PUTting identical data changes nothing (and does not
+    bump ``data_version``).  Notices already stored for the DOI start
+    applying to the article as soon as it exists.
+    """
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM articles WHERE doi = ?", (body.doi,)
+        ).fetchone()
+        if (
+            row is not None
+            and row["issn"] == body.issn
+            and row["pub_date"] == body.pub_date.isoformat()
+        ):
+            return _article_out(row)  # unchanged: no write, no version bump
+        if row is None:
+            conn.execute(
+                "INSERT INTO articles (doi, issn, pub_date) VALUES (?, ?, ?)",
+                (body.doi, body.issn, body.pub_date.isoformat()),
+            )
+            response.status_code = 201
+        else:
+            conn.execute(
+                "UPDATE articles SET issn = ?, pub_date = ? WHERE doi = ?",
+                (body.issn, body.pub_date.isoformat(), body.doi),
+            )
+        db.bump_version(conn)
+        return _article_out(
+            conn.execute("SELECT * FROM articles WHERE doi = ?", (body.doi,)).fetchone()
+        )
+
+
+@app.get("/articles", response_model=List[ArticleOut])
+def list_articles(doi: Optional[str] = Query(default=None)) -> List[ArticleOut]:
+    """List registered articles, optionally filtered to one DOI."""
+    with db.read_tx() as conn:
+        if doi is not None:
+            try:
+                norm = normalize_doi(doi)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            rows = conn.execute(
+                "SELECT * FROM articles WHERE doi = ?", (norm,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM articles ORDER BY doi").fetchall()
+        return [_article_out(r) for r in rows]
+
+
+# ---------------------------------------------------------------- notices
+
+def _notice_out(row: sqlite3.Row, max_revision: int, duplicate: bool = False) -> NoticeOut:
+    return NoticeOut(
+        id=row["id"],
+        doi=row["doi"],
+        source=row["source"],
+        revision=row["revision"],
+        kind=row["kind"],
+        note=row["note"],
+        duplicate=duplicate,
+        superseded=row["revision"] < max_revision,
+    )
+
+
+@app.post("/notices", response_model=NoticeOut)
+def submit_notice(body: NoticeCreate, response: Response) -> NoticeOut:
+    """Submit a retraction/restoration notice with source and revision.
+
+    * Identical resubmission of ``(doi, source, revision)`` -> 200,
+      no state change.
+    * Same ``(doi, source, revision)`` with a different conclusion ->
+      409, nothing stored.
+    * A revision lower than one already stored from this source is
+      archived but ``superseded`` — it never overrides the newer
+      conclusion.
+    * The article need not exist yet; the notice takes effect in the
+      report as soon as the article is registered.
+    """
+    with db.write_tx() as conn:
+        existing = conn.execute(
+            "SELECT * FROM notices WHERE doi = ? AND source = ? AND revision = ?",
+            (body.doi, body.source, body.revision),
+        ).fetchone()
+        if existing is not None:
+            if existing["kind"] != body.kind:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"notice {body.doi} / {body.source} / rev {body.revision} "
+                        f"already stored as {existing['kind']!r}; "
+                        "same source+revision with different content is rejected"
+                    ),
+                )
+            max_rev = conn.execute(
+                "SELECT MAX(revision) AS m FROM notices WHERE doi = ? AND source = ?",
+                (body.doi, body.source),
+            ).fetchone()["m"]
+            response.status_code = 200
+            return _notice_out(existing, max_rev, duplicate=True)
+
+        cur = conn.execute(
+            "INSERT INTO notices (doi, source, revision, kind, note)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (body.doi, body.source, body.revision, body.kind, body.note),
+        )
+        db.bump_version(conn)
+        row = conn.execute("SELECT * FROM notices WHERE id = ?", (cur.lastrowid,)).fetchone()
+        max_rev = conn.execute(
+            "SELECT MAX(revision) AS m FROM notices WHERE doi = ? AND source = ?",
+            (body.doi, body.source),
+        ).fetchone()["m"]
+        response.status_code = 201
+        return _notice_out(row, max_rev)
+
+
+@app.get("/notices", response_model=List[NoticeOut])
+def list_notices(doi: Optional[str] = Query(default=None)) -> List[NoticeOut]:
+    """Audit trail of stored notices, in arrival order."""
+    with db.read_tx() as conn:
+        if doi is not None:
+            try:
+                norm = normalize_doi(doi)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            rows = conn.execute(
+                "SELECT * FROM notices WHERE doi = ? ORDER BY id", (norm,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM notices ORDER BY id").fetchall()
+        max_revs = {
+            (r["doi"], r["source"]): r["m"]
+            for r in conn.execute(
+                "SELECT doi, source, MAX(revision) AS m FROM notices GROUP BY doi, source"
+            ).fetchall()
+        }
+        return [_notice_out(r, max_revs[(r["doi"], r["source"])]) for r in rows]
+
+
+# ---------------------------------------------------------------- report
+
+@app.get("/retractions", response_model=RetractionReport)
+def retraction_report(
+    query_date: date = Query(..., alias="date", description="Query date, YYYY-MM-DD"),
+) -> RetractionReport:
+    """Articles confirmed-retracted but still accessible on the query date.
+
+    ``confirmed``: every source's latest notice says retraction and some
+    licensed, active package serves the article on ``date`` (embargo wall
+    moves with the query date).  ``disputed``: accessible articles whose
+    sources' latest conclusions contradict each other — pending review.
+
+    Articles, notices, coverage and license windows are all read inside
+    ONE transaction, so the report always reflects a single committed
+    state; any correction triggers re-determination on the next query.
+    """
+    with db.read_tx() as conn:
+        version = db.current_version(conn)
+        articles = conn.execute(
+            "SELECT doi, issn, pub_date FROM articles ORDER BY doi"
+        ).fetchall()
+        notice_rows = conn.execute(
+            "SELECT doi, source, revision, kind FROM notices ORDER BY id"
+        ).fetchall()
+        cov_rows = conn.execute(
+            """
+            SELECT p.name AS package, c.issn, c.start_date, c.end_date, c.embargo_months
+            FROM coverage c
+            JOIN packages p ON p.id = c.package_id
+            WHERE p.active = 1
+              AND p.license_start <= ?
+              AND p.license_end   >= ?
+            """,
+            (query_date.isoformat(), query_date.isoformat()),
+        ).fetchall()
+
+    notices_by_doi: dict[str, list[NoticeRow]] = defaultdict(list)
+    for n in notice_rows:
+        notices_by_doi[n["doi"]].append(NoticeRow(n["source"], n["revision"], n["kind"]))
+
+    coverage_by_issn: dict[str, list[CoverageRow]] = defaultdict(list)
+    for r in cov_rows:
+        coverage_by_issn[r["issn"]].append(
+            CoverageRow(
+                package=r["package"],
+                start=date.fromisoformat(r["start_date"]),
+                end=date.fromisoformat(r["end_date"]),
+                embargo_months=r["embargo_months"],
+            )
+        )
+
+    confirmed: List[RetractionEntry] = []
+    disputed: List[RetractionEntry] = []
+    for a in articles:
+        notices = notices_by_doi.get(a["doi"])
+        if not notices:
+            continue
+        status, basis = classify_notices(notices)
+        if status not in ("retracted", "disputed"):
+            continue
+        pub = date.fromisoformat(a["pub_date"])
+        packages = packages_serving(coverage_by_issn.get(a["issn"], []), pub, query_date)
+        if not packages:
+            continue  # not accessible on the query date -> not on the list
+        entry = RetractionEntry(
+            doi=a["doi"],
+            issn=a["issn"],
+            pub_date=pub,
+            basis=[
+                NoticeBasis(source=b.source, revision=b.revision, kind=b.kind)
+                for b in basis
+            ],
+            packages=packages,
+        )
+        (confirmed if status == "retracted" else disputed).append(entry)
+
+    return RetractionReport(
+        date=query_date, data_version=version, confirmed=confirmed, disputed=disputed
     )

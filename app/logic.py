@@ -1,11 +1,12 @@
-"""Pure date/interval logic for the moving-wall access computation."""
+"""Pure date/interval logic for the moving-wall access computation,
+plus pure notice-classification logic for the retraction report."""
 
 from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 _ONE_DAY = timedelta(days=1)
 
@@ -87,3 +88,64 @@ def compute_segments(rows: Iterable[CoverageRow], query_date: date) -> List[Segm
         else:
             segments.append(Segment(a, seg_end, sources))
     return segments
+
+
+# ---------------------------------------------------------------- notices
+
+@dataclass(frozen=True)
+class NoticeRow:
+    source: str
+    revision: int
+    kind: str  # "retraction" | "restoration"
+
+
+def latest_per_source(notices: Iterable[NoticeRow]) -> Dict[str, NoticeRow]:
+    """Each source's current conclusion = its highest-revision notice.
+
+    A late-arriving lower revision never overrides a newer conclusion
+    from the same source; arrival order is irrelevant.
+    """
+    best: Dict[str, NoticeRow] = {}
+    for n in notices:
+        cur = best.get(n.source)
+        if cur is None or n.revision > cur.revision:
+            best[n.source] = n
+    return best
+
+
+def classify_notices(notices: Iterable[NoticeRow]) -> Tuple[str, List[NoticeRow]]:
+    """Classify one article from its notices.
+
+    Returns ``(status, basis)`` where ``basis`` is every source's latest
+    notice (sorted by source) and ``status`` is one of:
+
+    * ``"none"``      -- no notices at all;
+    * ``"retracted"`` -- every source's latest conclusion is retraction;
+    * ``"restored"``  -- every source's latest conclusion is restoration;
+    * ``"disputed"``  -- sources' latest conclusions contradict each other
+      (pending manual review).
+    """
+    best = latest_per_source(notices)
+    if not best:
+        return "none", []
+    basis = [best[s] for s in sorted(best)]
+    kinds = {n.kind for n in basis}
+    if len(kinds) > 1:
+        return "disputed", basis
+    return ("retracted" if kinds == {"retraction"} else "restored"), basis
+
+
+def packages_serving(
+    rows: Iterable[CoverageRow], pub_date: date, query_date: date
+) -> List[str]:
+    """Names of packages whose accessible window covers ``pub_date``.
+
+    The embargo wall moves with ``query_date``, so the answer is
+    re-derived for every query date.
+    """
+    names = set()
+    for row in rows:
+        acc = accessible_interval(row, query_date)
+        if acc is not None and acc[0] <= pub_date <= acc[1]:
+            names.add(row.package)
+    return sorted(names)
